@@ -1,8 +1,10 @@
 # market-server 通用审批管理模块 — 技术规格书（Spec）
 
-> **版本**: v10.1 | **日期**: 2026-06-23 | **状态**: 待评审
+> **版本**: v10.3 | **日期**: 2026-07-01 | **状态**: 待评审
 >
 > **效果图**: 浏览器打开 [`approval-page-mockup.html`](./approval-page-mockup.html) 可交互预览
+>
+> **v10.3 变更摘要**: DAO 层去除 `Map<String,Object>` 返回，新增 `PublishedAppDto` / `PropertyEntity` 实体类 + resultMap；分页参数 clamp（curPage≥1, pageSize 1~50）；N+1 查询优化为批量查询（收集 ID 列表一次性查 version/app/ability/applicant/eamapAppCode）；循环内 try-catch 单条容错（失败跳过不影响其他）；更新 §2.1 / §5.1 / §6.1
 >
 > **v10.2 变更摘要**: 响应 VO 新增 `hisAppId` 字段（`openplatform_app_p_t.eamap_app_code`，用于前端展示），`appId` 恢复为 `openplatform_app_t.app_id`（用于路由跳转应用详情）；前端应用ID列 dataIndex 改为 hisAppId，查看按钮路由使用 appId；更新 §2.1 / §2.2.4 / §4.2
 >
@@ -140,10 +142,10 @@ GET /service/open/v2/apps/pending
 
 | 参数 | 类型 | 必填 | 说明 |
 |------|------|:----:|------|
-| curPage | Integer | 否 | 当前页，默认 1 |
-| pageSize | Integer | 否 | 每页条数，默认 10，前端可选 10/20/50 |
+| curPage | Integer | 否 | 当前页，默认 1，最小 1（Service 层 clamp） |
+| pageSize | Integer | 否 | 每页条数，默认 10，最小 1，最大 50（Service 层 clamp） |
 
-> **说明**：当前不提供搜索/过滤参数，后续迭代按需增加。
+> **说明**：当前不提供搜索/过滤参数，后续迭代按需增加。分页参数由 Service 层校验 clamp，非法值自动修正为安全默认值。
 
 **响应**（`ApiResponse`）`[src/market-server/.../model/ApiResponse.java]`：
 
@@ -935,15 +937,22 @@ ApprovalController（3 个端点：pending / publish / approval）
     ▼
 ApprovalServiceImpl（流程编排）
     │
-    ├─ 待审批列表:
+    ├─ 待审批列表（批量查询，避免 N+1）:
     │    ├─ 1. 单表查 approval_record_t（按 business_type + status 过滤）
-    │    ├─ 2. 单表查 app_version_t by versionId → version_code, app_id
-    │    ├─ 3. 单表查 app_t by appPkId → app_name_cn, app_name_en
-    │    ├─ 4. 单表查 app_p_t → eamap_app_code
-    │    ├─ 5. 单表查 app_version_p_t → abilityIds → 查 ability_t → 能力名称
-    │    └─ 6. 整合为 ApprovalListVo
+    │    ├─ 2. 收集 versionId → 批量查 app_version_t → Map<versionId, version>
+    │    ├─ 3. 收集 appPkId → 批量查 app_t → Map<appPkId, app>
+    │    ├─ 4. 批量查 app_p_t → eamap_app_code → Map<appPkId, code>
+    │    ├─ 5. 批量查 app_version_p_t → abilityIds → Map<versionId, ids>
+    │    ├─ 6. 收集所有 abilityId → 批量查 ability_t → Map<abilityId, name>
+    │    └─ 7. 循环装配 VO（单条失败 try-catch 跳过，不影响其他）
     │
-    ├─ 已上架列表（app_t 主表 + 子查询取 MAX(version_code) WHERE v.status=4）
+    ├─ 已上架列表（批量查询，避免 N+1）:
+    │    ├─ 1. app_t 主表 + 子查询取 MAX(version_code) WHERE v.status=4
+    │    ├─ 2. 收集 versionId → 批量查 app_version_p_t → abilityIds
+    │    ├─ 3. 收集 versionId → 批量查 approval_record_t → applicantId
+    │    ├─ 4. 收集 appPkId → 批量查 app_p_t → eamap_app_code
+    │    ├─ 5. 收集所有 abilityId → 批量查 ability_t → 能力名称
+    │    └─ 6. 循环装配 VO（单条失败 try-catch 跳过，不影响其他）
     │
     └─ 审批操作（process 统一入口）:
          ├─ 状态/权限校验
@@ -1270,38 +1279,52 @@ public enum AppVersionStatusEnum {
 | 10 | `approval/mapper/ApprovalRecordMapper.java` | Mapper 接口 |
 | 11 | `approval/mapper/ApprovalLogMapper.java` | Mapper 接口 |
 | 12 | `approval/mapper/ApprovalFlowMapper.java` | Mapper 接口 |
-| 13 | `approval/dto/ApprovalNodeDto.java` | 节点 DTO |
-| 14 | `approval/dto/ApprovalListRequest.java` | 列表查询请求（curPage, pageSize） |
-| 15 | `approval/dto/ApprovalProcessRequest.java` | 审批操作请求（id: String, action: Integer） |
-| 16 | `approval/vo/ApprovalListVo.java` | 列表展示 VO |
-| 17 | `approval/constant/ApprovalConstants.java` | 状态/操作常量 |
-| 18 | `approval/constant/AppVersionStatusEnum.java` | 应用版本状态枚举（DRAFT/IN_PROCESS/REJECTED/APPROVED/CANCELLED） |
+| 13 | `approval/dto/ApprovalListRequest.java` | 列表查询请求（curPage, pageSize） |
+| 14 | `approval/dto/ApprovalProcessRequest.java` | 审批操作请求（id: String, action: Integer） |
+| 15 | `approval/vo/ApprovalListVo.java` | 列表展示 VO（含 appId + hisAppId） |
+| 16 | `approval/constant/ApprovalConstants.java` | 状态/操作常量 |
+| 17 | `approval/constant/AppVersionStatusEnum.java` | 应用版本状态枚举（DRAFT/IN_PROCESS/REJECTED/APPROVED/CANCELLED） |
 
-**v10.1 新建文件（6 个）**：
+**v10.1 新建文件（4 个）**：
 
 | # | 文件路径 | 说明 |
 |:-:|---------|------|
-| 19 | `approval/entity/AppEntity.java` | 应用实体（对应 `openplatform_app_t`） |
-| 20 | `approval/entity/AppVersionEntity.java` | 版本实体（对应 `openplatform_app_version_t`） |
-| 21 | `approval/mapper/AppMapper.java` | 应用 Mapper（`selectById`） |
-| 22 | `approval/mapper/AppVersionMapper.java` | 版本 Mapper（`selectById` + `updateStatus`） |
+| 18 | `approval/entity/AppEntity.java` | 应用实体（对应 `openplatform_app_t`） |
+| 19 | `approval/entity/AppVersionEntity.java` | 版本实体（对应 `openplatform_app_version_t`） |
+| 20 | `approval/mapper/AppMapper.java` | 应用 Mapper（`selectById`） |
+| 21 | `approval/mapper/AppVersionMapper.java` | 版本 Mapper（`selectById` + `selectByIds` + `updateStatus`） |
 
-**v10.1 修改文件（4 个）**：
+**v10.3 新建文件（2 个）**：
+
+| # | 文件路径 | 说明 |
+|:-:|---------|------|
+| 22 | `approval/entity/PublishedAppDto.java` | 已上架应用查询结果 DTO（替代 Map） |
+| 23 | `approval/entity/PropertyEntity.java` | KV 属性表查询结果 DTO（parent_id + property_value，替代 Map） |
+
+**v10.1 修改文件（2 个）**：
 
 | # | 文件路径 | 变更 |
 |:-:|---------|------|
-| 23 | `approval/service/impl/ApprovalServiceImpl.java` | `getPendingList` 改为单表查询 + Service 层补查 version→app→能力→第三方ID |
-| 24 | `approval/handler/AppVersionPublishHandler.java` | `onApproved/onRejected` 补充版本状态更新（引用 `AppVersionStatusEnum`） |
+| 24 | `approval/service/impl/ApprovalServiceImpl.java` | `getPendingList` 改为单表查询 + Service 层补查 version→app→能力→第三方ID |
+| 25 | `approval/handler/AppVersionPublishHandler.java` | `onApproved/onRejected` 补充版本状态更新（引用 `AppVersionStatusEnum`） |
+
+**v10.3 修改文件（3 个）**：
+
+| # | 文件路径 | 变更 |
+|:-:|---------|------|
+| 26 | `approval/mapper/ApprovalRecordMapper.java` | 4 处 `List<Map>` → `List<PublishedAppDto>` / `List<PropertyEntity>`，新增批量方法 |
+| 27 | `approval/mapper/AppVersionMapper.java` | 新增 `selectByIds` 批量方法 |
+| 28 | `approval/service/impl/ApprovalServiceImpl.java` | 分页 clamp + N+1 批量查询 + 单条容错 + 去 Map 化 |
 
 **MyBatis XML 文件**（路径前缀 `market-server/src/main/resources/mapper/`）：
 
 | # | 文件路径 | 状态 | 说明 |
 |:-:|---------|:----:|------|
-| 25 | `ApprovalRecordMapper.xml` | 修改 | `selectPendingList` 改为单表查 approval_record_t；保留 selectCapabilityNames、selectThirdPartyAppId |
-| 26 | `ApprovalLogMapper.xml` | 不变 | SQL（insert） |
-| 27 | `ApprovalFlowMapper.xml` | 不变 | SQL（selectByCode） |
-| 28 | `AppMapper.xml` | **新建** | 单表 SELECT app_t（selectById） |
-| 29 | `AppVersionMapper.xml` | **新建** | 单表 SELECT + UPDATE version_t（selectById, updateStatus） |
+| 29 | `ApprovalRecordMapper.xml` | 修改 | `selectPendingList` 改为单表查 approval_record_t；新增 3 条批量查询 + 2 个 resultMap（PublishedAppResultMap, PropertyResultMap） |
+| 30 | `ApprovalLogMapper.xml` | 不变 | SQL（insert） |
+| 31 | `ApprovalFlowMapper.xml` | 不变 | SQL（selectByCode） |
+| 32 | `AppMapper.xml` | **新建** | 单表 SELECT app_t（selectById） |
+| 33 | `AppVersionMapper.xml` | **新建** | 单表 SELECT + UPDATE version_t（selectById, selectByIds, updateStatus） |
 
 ### 6.2 前端新建文件（4 个）
 
