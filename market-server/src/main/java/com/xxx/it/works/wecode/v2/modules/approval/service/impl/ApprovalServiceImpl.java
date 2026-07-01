@@ -8,6 +8,8 @@ import com.xxx.it.works.wecode.v2.modules.approval.entity.AbilityEntity;
 import com.xxx.it.works.wecode.v2.modules.approval.entity.AppEntity;
 import com.xxx.it.works.wecode.v2.modules.approval.entity.ApprovalRecord;
 import com.xxx.it.works.wecode.v2.modules.approval.entity.AppVersionEntity;
+import com.xxx.it.works.wecode.v2.modules.approval.entity.PropertyEntity;
+import com.xxx.it.works.wecode.v2.modules.approval.entity.PublishedAppDto;
 import com.xxx.it.works.wecode.v2.modules.approval.mapper.AbilityMapper;
 import com.xxx.it.works.wecode.v2.modules.approval.mapper.AppMapper;
 import com.xxx.it.works.wecode.v2.modules.approval.mapper.ApprovalRecordMapper;
@@ -22,6 +24,7 @@ import org.springframework.transaction.annotation.Transactional;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.stream.Collectors;
@@ -29,6 +32,9 @@ import java.util.stream.Collectors;
 @Slf4j
 @Service
 public class ApprovalServiceImpl implements ApprovalService {
+
+    /** 每页最大条数 */
+    private static final int MAX_PAGE_SIZE = 50;
 
     @Autowired
     private ApprovalRecordMapper recordMapper;
@@ -47,16 +53,48 @@ public class ApprovalServiceImpl implements ApprovalService {
 
     @Override
     public ApiResponse<List<ApprovalListVo>> getPendingList(ApprovalListRequest request) {
-        try {
-            int curPage = request.getCurPage() != null ? request.getCurPage() : 1;
-            int pageSize = request.getPageSize() != null ? request.getPageSize() : 10;
-            int offset = (curPage - 1) * pageSize;
+        int curPage = clampCurPage(request.getCurPage());
+        int pageSize = clampPageSize(request.getPageSize());
+        int offset = (curPage - 1) * pageSize;
 
-            List<ApprovalRecord> records = recordMapper.selectPendingList(offset, pageSize);
-            long total = recordMapper.countPendingList();
+        List<ApprovalRecord> records = recordMapper.selectPendingList(offset, pageSize);
+        long total = recordMapper.countPendingList();
 
-            List<ApprovalListVo> voList = new ArrayList<>();
-            for (ApprovalRecord record : records) {
+        // --- 批量补查，避免 N+1 ---
+
+        // 1. 收集 versionId，批量查版本
+        List<Long> versionIds = records.stream()
+                .map(r -> safeParseLong(r.getBusinessId()))
+                .filter(id -> id != null)
+                .collect(Collectors.toList());
+        Map<Long, AppVersionEntity> versionMap = batchQueryVersions(versionIds);
+
+        // 2. 收集 appPkId（来自 version.appId），批量查应用
+        List<Long> appPkIds = versionMap.values().stream()
+                .map(AppVersionEntity::getAppId)
+                .filter(id -> id != null)
+                .distinct()
+                .collect(Collectors.toList());
+        Map<Long, AppEntity> appMap = batchQueryApps(appPkIds);
+
+        // 3. 批量查 eamap_app_code
+        Map<Long, String> eamapMap = batchQueryEamapAppCodes(appPkIds);
+
+        // 4. 批量查版本属性表 abilityIds
+        Map<Long, String> abilityIdsMap = batchQueryVersionAbilityIds(versionIds);
+
+        // 5. 收集所有 abilityId，批量查能力名称
+        List<Long> allAbilityIds = abilityIdsMap.values().stream()
+                .filter(s -> s != null && !s.isEmpty())
+                .flatMap(s -> parseIds(s).stream())
+                .distinct()
+                .collect(Collectors.toList());
+        Map<Long, String> abilityNameMap = batchQueryAbilityNames(allAbilityIds);
+
+        // --- 装配 VO（单条失败不影响其他） ---
+        List<ApprovalListVo> voList = new ArrayList<>();
+        for (ApprovalRecord record : records) {
+            try {
                 ApprovalListVo vo = new ApprovalListVo();
                 vo.setId(String.valueOf(record.getId()));
                 vo.setBusinessType(record.getBusinessType());
@@ -65,110 +103,110 @@ public class ApprovalServiceImpl implements ApprovalService {
                 vo.setStatus(record.getStatus());
                 vo.setCreateTime(record.getCreateTime());
 
-                Long versionId = Long.parseLong(record.getBusinessId());
-                AppVersionEntity version = appVersionMapper.selectById(versionId);
+                Long versionId = safeParseLong(record.getBusinessId());
+                AppVersionEntity version = versionMap.get(versionId);
                 if (version != null) {
                     vo.setVersionNo(version.getVersionCode());
 
-                    AppEntity app = appMapper.selectById(version.getAppId());
+                    AppEntity app = appMap.get(version.getAppId());
                     if (app != null) {
                         vo.setAppNameCn(app.getAppNameCn());
                         vo.setAppNameEn(app.getAppNameEn());
                         vo.setAppId(app.getAppId());
-                        // hisAppId 从应用属性表补查 eamap_app_code
-                        vo.setHisAppId(recordMapper.selectThirdPartyAppId(app.getId()));
+                        vo.setHisAppId(eamapMap.get(app.getId()));
                     }
 
-                    String abilityIdsStr = recordMapper.selectVersionAbilityIds(versionId);
+                    String abilityIdsStr = abilityIdsMap.get(versionId);
                     if (abilityIdsStr != null && !abilityIdsStr.isEmpty()) {
-                        List<Long> abilityIds = parseIds(abilityIdsStr);
-                        if (!abilityIds.isEmpty()) {
-                            List<AbilityEntity> abilities = abilityMapper.selectByIds(abilityIds);
-                            vo.setCapabilityNames(abilities.stream()
-                                    .map(AbilityEntity::getAbilityNameCn)
-                                    .collect(Collectors.joining(", ")));
-                        }
+                        List<String> names = parseIds(abilityIdsStr).stream()
+                                .map(abilityNameMap::get)
+                                .filter(n -> n != null)
+                                .collect(Collectors.toList());
+                        vo.setCapabilityNames(String.join(", ", names));
                     }
                 }
 
                 voList.add(vo);
+            } catch (Exception e) {
+                log.warn("Skipping pending record id={} due to enrichment error", record.getId(), e);
             }
-
-            int totalPages = (int) ((total + pageSize - 1) / pageSize);
-            ApiResponse.PageResponse page = ApiResponse.PageResponse.builder()
-                    .curPage(curPage)
-                    .pageSize(pageSize)
-                    .total(total)
-                    .totalPages(totalPages)
-                    .build();
-            return ApiResponse.success(voList, page);
-        } catch (Exception e) {
-            log.error("Failed to get pending list", e);
-            return ApiResponse.error("500", "查询待审批列表失败", "Failed to get pending list");
         }
+
+        return successPage(voList, total, curPage, pageSize);
     }
 
     @Override
     public ApiResponse<List<ApprovalListVo>> getPublishedList(ApprovalListRequest request) {
-        try {
-            int curPage = request.getCurPage() != null ? request.getCurPage() : 1;
-            int pageSize = request.getPageSize() != null ? request.getPageSize() : 10;
-            int offset = (curPage - 1) * pageSize;
+        int curPage = clampCurPage(request.getCurPage());
+        int pageSize = clampPageSize(request.getPageSize());
+        int offset = (curPage - 1) * pageSize;
 
-            List<Map<String, Object>> records = recordMapper.selectPublishedList(offset, pageSize);
-            long total = recordMapper.countPublishedList();
+        List<PublishedAppDto> records = recordMapper.selectPublishedList(offset, pageSize);
+        long total = recordMapper.countPublishedList();
 
-            List<ApprovalListVo> voList = new ArrayList<>();
-            for (Map<String, Object> record : records) {
+        // --- 批量补查，避免 N+1 ---
+
+        // 1. 收集 versionId，批量查版本属性表 abilityIds
+        List<Long> versionIds = records.stream()
+                .map(PublishedAppDto::getVersionId)
+                .filter(id -> id != null)
+                .collect(Collectors.toList());
+        Map<Long, String> abilityIdsMap = batchQueryVersionAbilityIds(versionIds);
+
+        // 2. 批量查申请人
+        Map<Long, String> applicantMap = batchQueryApplicants(versionIds);
+
+        // 3. 收集 appPkId，批量查 eamap_app_code
+        List<Long> appPkIds = records.stream()
+                .map(PublishedAppDto::getAppPkId)
+                .filter(id -> id != null)
+                .distinct()
+                .collect(Collectors.toList());
+        Map<Long, String> eamapMap = batchQueryEamapAppCodes(appPkIds);
+
+        // 4. 收集所有 abilityId，批量查能力名称
+        List<Long> allAbilityIds = abilityIdsMap.values().stream()
+                .filter(s -> s != null && !s.isEmpty())
+                .flatMap(s -> parseIds(s).stream())
+                .distinct()
+                .collect(Collectors.toList());
+        Map<Long, String> abilityNameMap = batchQueryAbilityNames(allAbilityIds);
+
+        // --- 装配 VO（单条失败不影响其他） ---
+        List<ApprovalListVo> voList = new ArrayList<>();
+        for (PublishedAppDto record : records) {
+            try {
                 ApprovalListVo vo = new ApprovalListVo();
 
-                Long appPkId = toLong(record.get("app_pk_id"));
-                Long versionId = toLong(record.get("version_id"));
+                Long appPkId = record.getAppPkId();
+                Long versionId = record.getVersionId();
 
-                // id = 应用主键 ID
                 vo.setId(appPkId != null ? String.valueOf(appPkId) : null);
-                // appId = openplatform_app_t.app_id（用于路由跳转）
-                vo.setAppId(toString(record.get("app_id")));
-                // hisAppId 从应用属性表补查 eamap_app_code
-                if (appPkId != null) {
-                    vo.setHisAppId(recordMapper.selectThirdPartyAppId(appPkId));
-                }
-                vo.setAppNameCn(toString(record.get("app_name_cn")));
-                vo.setAppNameEn(toString(record.get("app_name_en")));
-                vo.setVersionNo(toString(record.get("version_code")));
-                vo.setCreateTime(toDate(record.get("create_time")));
+                vo.setAppId(record.getAppId());
+                vo.setHisAppId(eamapMap.get(appPkId));
+                vo.setAppNameCn(record.getAppNameCn());
+                vo.setAppNameEn(record.getAppNameEn());
+                vo.setVersionNo(record.getVersionCode());
+                vo.setCreateTime(record.getCreateTime());
 
-                if (versionId != null) {
-                    String abilityIdsStr = recordMapper.selectVersionAbilityIds(versionId);
-                    if (abilityIdsStr != null && !abilityIdsStr.isEmpty()) {
-                        List<Long> abilityIds = parseIds(abilityIdsStr);
-                        if (!abilityIds.isEmpty()) {
-                            List<AbilityEntity> abilities = abilityMapper.selectByIds(abilityIds);
-                            vo.setCapabilityNames(abilities.stream()
-                                    .map(AbilityEntity::getAbilityNameCn)
-                                    .collect(Collectors.joining(", ")));
-                        }
-                    }
-
-                    String applicantId = recordMapper.selectApplicantByVersionId(versionId);
-                    vo.setApplicantId(applicantId);
+                String abilityIdsStr = abilityIdsMap.get(versionId);
+                if (abilityIdsStr != null && !abilityIdsStr.isEmpty()) {
+                    List<String> names = parseIds(abilityIdsStr).stream()
+                            .map(abilityNameMap::get)
+                            .filter(n -> n != null)
+                            .collect(Collectors.toList());
+                    vo.setCapabilityNames(String.join(", ", names));
                 }
+
+                vo.setApplicantId(applicantMap.get(versionId));
 
                 voList.add(vo);
+            } catch (Exception e) {
+                log.warn("Skipping published record appPkId={} due to enrichment error", record.getAppPkId(), e);
             }
-
-            int totalPages = (int) ((total + pageSize - 1) / pageSize);
-            ApiResponse.PageResponse page = ApiResponse.PageResponse.builder()
-                    .curPage(curPage)
-                    .pageSize(pageSize)
-                    .total(total)
-                    .totalPages(totalPages)
-                    .build();
-            return ApiResponse.success(voList, page);
-        } catch (Exception e) {
-            log.error("Failed to get published list", e);
-            return ApiResponse.error("500", "查询已上架列表失败", "Failed to get published list");
         }
+
+        return successPage(voList, total, curPage, pageSize);
     }
 
     @Override
@@ -187,6 +225,71 @@ public class ApprovalServiceImpl implements ApprovalService {
         }
     }
 
+    // ===================== 分页参数校验 =====================
+
+    private int clampCurPage(Integer curPage) {
+        if (curPage == null || curPage < 1) return 1;
+        return curPage;
+    }
+
+    private int clampPageSize(Integer pageSize) {
+        if (pageSize == null || pageSize < 1) return 10;
+        return Math.min(pageSize, MAX_PAGE_SIZE);
+    }
+
+    // ===================== 批量查询 =====================
+
+    private Map<Long, AppVersionEntity> batchQueryVersions(List<Long> ids) {
+        if (ids.isEmpty()) return Collections.emptyMap();
+        return appVersionMapper.selectByIds(ids).stream()
+                .collect(Collectors.toMap(AppVersionEntity::getId, v -> v));
+    }
+
+    private Map<Long, AppEntity> batchQueryApps(List<Long> ids) {
+        if (ids.isEmpty()) return Collections.emptyMap();
+        Map<Long, AppEntity> map = new HashMap<>();
+        for (Long id : ids) {
+            AppEntity app = appMapper.selectById(id);
+            if (app != null) map.put(id, app);
+        }
+        return map;
+    }
+
+    private Map<Long, String> batchQueryEamapAppCodes(List<Long> appIds) {
+        if (appIds.isEmpty()) return Collections.emptyMap();
+        Map<Long, String> map = new HashMap<>();
+        for (PropertyEntity prop : recordMapper.selectEamapAppCodesByAppIds(appIds)) {
+            map.put(prop.getParentId(), prop.getPropertyValue());
+        }
+        return map;
+    }
+
+    private Map<Long, String> batchQueryVersionAbilityIds(List<Long> versionIds) {
+        if (versionIds.isEmpty()) return Collections.emptyMap();
+        Map<Long, String> map = new HashMap<>();
+        for (PropertyEntity prop : recordMapper.selectVersionAbilityIdsBatch(versionIds)) {
+            map.put(prop.getParentId(), prop.getPropertyValue());
+        }
+        return map;
+    }
+
+    private Map<Long, String> batchQueryApplicants(List<Long> versionIds) {
+        if (versionIds.isEmpty()) return Collections.emptyMap();
+        Map<Long, String> map = new HashMap<>();
+        for (PropertyEntity prop : recordMapper.selectApplicantsByVersionIds(versionIds)) {
+            map.put(prop.getParentId(), prop.getPropertyValue());
+        }
+        return map;
+    }
+
+    private Map<Long, String> batchQueryAbilityNames(List<Long> abilityIds) {
+        if (abilityIds.isEmpty()) return Collections.emptyMap();
+        return abilityMapper.selectByIds(abilityIds).stream()
+                .collect(Collectors.toMap(AbilityEntity::getId, AbilityEntity::getAbilityNameCn));
+    }
+
+    // ===================== 工具方法 =====================
+
     private List<Long> parseIds(String idsStr) {
         if (idsStr == null || idsStr.trim().isEmpty()) {
             return Collections.emptyList();
@@ -198,18 +301,19 @@ public class ApprovalServiceImpl implements ApprovalService {
                 .collect(Collectors.toList());
     }
 
-    private Long toLong(Object value) {
-        if (value == null) return null;
-        if (value instanceof Number) return ((Number) value).longValue();
-        try { return Long.parseLong(value.toString()); } catch (NumberFormatException e) { return null; }
+    private Long safeParseLong(String value) {
+        if (value == null || value.isEmpty()) return null;
+        try { return Long.parseLong(value); } catch (NumberFormatException e) { return null; }
     }
 
-    private String toString(Object value) {
-        return value != null ? value.toString() : null;
-    }
-
-    private java.util.Date toDate(Object value) {
-        if (value instanceof java.util.Date) return (java.util.Date) value;
-        return null;
+    private ApiResponse<List<ApprovalListVo>> successPage(List<ApprovalListVo> voList, long total, int curPage, int pageSize) {
+        int totalPages = (int) ((total + pageSize - 1) / pageSize);
+        ApiResponse.PageResponse page = ApiResponse.PageResponse.builder()
+                .curPage(curPage)
+                .pageSize(pageSize)
+                .total(total)
+                .totalPages(totalPages)
+                .build();
+        return ApiResponse.success(voList, page);
     }
 }

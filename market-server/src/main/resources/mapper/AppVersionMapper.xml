@@ -30,6 +30,17 @@
         WHERE id = #{id}
     </select>
 
+    <!-- ==================== selectByIds ==================== -->
+    <select id="selectByIds" resultMap="BaseResultMap">
+        SELECT
+        <include refid="Base_Column_List"/>
+        FROM openplatform_app_version_t
+        WHERE id IN
+        <foreach collection="ids" item="id" open="(" separator="," close=")">
+            #{id}
+        </foreach>
+    </select>
+
     <!-- ==================== updateStatus ==================== -->
     <update id="updateStatus">
         UPDATE openplatform_app_version_t

@@ -19,6 +19,22 @@
         <result column="completed_at" property="completedAt"/>
     </resultMap>
 
+    <resultMap id="PublishedAppResultMap" type="com.xxx.it.works.wecode.v2.modules.approval.entity.PublishedAppDto">
+        <id column="app_pk_id" property="appPkId"/>
+        <result column="app_id" property="appId"/>
+        <result column="app_name_cn" property="appNameCn"/>
+        <result column="app_name_en" property="appNameEn"/>
+        <result column="create_time" property="createTime"/>
+        <result column="last_update_time" property="lastUpdateTime"/>
+        <result column="version_id" property="versionId"/>
+        <result column="version_code" property="versionCode"/>
+    </resultMap>
+
+    <resultMap id="PropertyResultMap" type="com.xxx.it.works.wecode.v2.modules.approval.entity.PropertyEntity">
+        <id column="parent_id" property="parentId"/>
+        <result column="property_value" property="propertyValue"/>
+    </resultMap>
+
     <sql id="Base_Column_List">
         id, business_type, business_id, applicant_id, applicant_name,
         status, current_node, combined_nodes,
@@ -53,7 +69,7 @@
     </select>
 
     <!-- ==================== selectPublishedList (app_t main + subquery) ==================== -->
-    <select id="selectPublishedList" resultType="java.util.Map">
+    <select id="selectPublishedList" resultMap="PublishedAppResultMap">
         SELECT a.id AS app_pk_id, a.app_id, a.app_name_cn, a.app_name_en,
                a.create_time, a.last_update_time,
                v.id AS version_id, v.version_code
@@ -118,6 +134,45 @@
         SELECT property_value
         FROM openplatform_app_p_t
         WHERE parent_id = #{appPkId} AND property_name = 'eamap_app_code'
+    </select>
+
+    <!-- ==================== selectVersionAbilityIdsBatch ==================== -->
+    <select id="selectVersionAbilityIdsBatch" resultMap="PropertyResultMap">
+        SELECT parent_id, property_value
+        FROM openplatform_app_version_p_t
+        WHERE parent_id IN
+        <foreach collection="versionIds" item="vid" open="(" separator="," close=")">
+            #{vid}
+        </foreach>
+        AND property_name = 'abilityIds'
+    </select>
+
+    <!-- ==================== selectApplicantsByVersionIds ==================== -->
+    <select id="selectApplicantsByVersionIds" resultMap="PropertyResultMap">
+        SELECT t.business_id AS parent_id, t.applicant_id AS property_value
+        FROM openplatform_v2_approval_record_t t
+        INNER JOIN (
+            SELECT business_id, MAX(id) AS max_id
+            FROM openplatform_v2_approval_record_t
+            WHERE business_id IN
+            <foreach collection="versionIds" item="vid" open="(" separator="," close=")">
+                #{vid}
+            </foreach>
+            AND status = 1
+            AND business_type = 'app_version_publish'
+            GROUP BY business_id
+        ) latest ON t.id = latest.max_id
+    </select>
+
+    <!-- ==================== selectEamapAppCodesByAppIds ==================== -->
+    <select id="selectEamapAppCodesByAppIds" resultMap="PropertyResultMap">
+        SELECT parent_id, property_value
+        FROM openplatform_app_p_t
+        WHERE parent_id IN
+        <foreach collection="appIds" item="appId" open="(" separator="," close=")">
+            #{appId}
+        </foreach>
+        AND property_name = 'eamap_app_code'
     </select>
 
 </mapper>
